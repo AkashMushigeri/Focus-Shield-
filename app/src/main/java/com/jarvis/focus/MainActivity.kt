@@ -13,8 +13,12 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -41,6 +45,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.jarvis.focus.data.DataRepository
+import com.jarvis.focus.ui.permissions.PermissionManager
+import com.jarvis.focus.ui.permissions.PermissionOnboardingScreen
 import com.jarvis.focus.ui.theme.FocusTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -59,19 +65,19 @@ class MainViewModel : ViewModel() {
     private val _dailyGoalMinutes = MutableStateFlow(120)
     val dailyGoalMinutes = _dailyGoalMinutes.asStateFlow()
 
-    private val _permissionsGranted = MutableStateFlow(true)
+    private val _permissionsGranted = MutableStateFlow(false)
     val permissionsGranted = _permissionsGranted.asStateFlow()
 
     private val _isStrictMode = MutableStateFlow(false)
     val isStrictMode = _isStrictMode.asStateFlow()
 
-    private val _usagePermission = MutableStateFlow(true)
+    private val _usagePermission = MutableStateFlow(false)
     val usagePermission = _usagePermission.asStateFlow()
 
-    private val _overlayPermission = MutableStateFlow(true)
+    private val _overlayPermission = MutableStateFlow(false)
     val overlayPermission = _overlayPermission.asStateFlow()
 
-    private val _batteryPermission = MutableStateFlow(true)
+    private val _batteryPermission = MutableStateFlow(false)
     val batteryPermission = _batteryPermission.asStateFlow()
 
     private val _batteryAsked = MutableStateFlow(false)
@@ -104,56 +110,60 @@ class MainViewModel : ViewModel() {
 
 class MainActivity : ComponentActivity() {
 
+    private lateinit var viewModel: MainViewModel
+    private lateinit var repository: DataRepository
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        val repository = DataRepository.getInstance(this)
+        repository = DataRepository.getInstance(this)
 
         setContent {
-            val viewModel: MainViewModel = viewModel()
+            viewModel = viewModel()
             val isRunning by viewModel.isServiceRunning.collectAsStateWithLifecycle()
             val usageMs by viewModel.totalUsageMs.collectAsStateWithLifecycle()
             val dailyGoal by viewModel.dailyGoalMinutes.collectAsStateWithLifecycle()
             val permissionsGranted by viewModel.permissionsGranted.collectAsStateWithLifecycle()
             val isStrictMode by viewModel.isStrictMode.collectAsStateWithLifecycle()
-            
-            val usageOk by viewModel.usagePermission.collectAsStateWithLifecycle()
-            val overlayOk by viewModel.overlayPermission.collectAsStateWithLifecycle()
-            val batteryOk by viewModel.batteryPermission.collectAsStateWithLifecycle()
-            val batteryAsked by viewModel.batteryAsked.collectAsStateWithLifecycle()
 
             FocusTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    Box {
-                        MainScreen(
-                            isRunning = isRunning,
-                            usageMs = usageMs,
-                            dailyGoal = dailyGoal,
-                            isStrictMode = isStrictMode,
-                            onToggleShield = { if (isRunning) stopMonitoring() else startMonitoring() },
-                            onViewStatsClick = { viewStats() },
-                            onSelectAppsClick = { selectApps() },
-                            onUpdateGoal = { viewModel.setDailyGoal(it) },
-                            onToggleStrictMode = { 
-                                val newMode = !isStrictMode
-                                viewModel.setStrictMode(newMode)
-                                lifecycleScope.launch { repository.setStrictMode(newMode) }
-                                if (newMode) Toast.makeText(this@MainActivity, "Strict Mode Active!", Toast.LENGTH_SHORT).show()
-                            }
-                        )
-
-                        if (!permissionsGranted) {
-                            PermissionOverlay(
-                                usageOk = usageOk,
-                                overlayOk = overlayOk,
-                                batteryOk = batteryOk,
-                                batteryAsked = batteryAsked,
-                                onGrantUsage = { requestUsagePermission() },
-                                onGrantOverlay = { requestOverlayPermission() },
-                                onGrantBattery = { requestBatteryPermission(repository) }
+                    AnimatedContent(
+                        targetState = permissionsGranted,
+                        transitionSpec = {
+                            fadeIn(animationSpec = tween(400)) togetherWith
+                                    fadeOut(animationSpec = tween(300))
+                        },
+                        label = "app_root_transition"
+                    ) { hasPermissions ->
+                        if (hasPermissions) {
+                            MainScreen(
+                                isRunning = isRunning,
+                                usageMs = usageMs,
+                                dailyGoal = dailyGoal,
+                                isStrictMode = isStrictMode,
+                                onToggleShield = { if (isRunning) stopMonitoring() else startMonitoring() },
+                                onViewStatsClick = { viewStats() },
+                                onSelectAppsClick = { selectApps() },
+                                onUpdateGoal = { viewModel.setDailyGoal(it) },
+                                onToggleStrictMode = { 
+                                    val newMode = !isStrictMode
+                                    viewModel.setStrictMode(newMode)
+                                    lifecycleScope.launch { repository.setStrictMode(newMode) }
+                                    if (newMode) Toast.makeText(this@MainActivity, "Strict Mode Active!", Toast.LENGTH_SHORT).show()
+                                }
+                            )
+                        } else {
+                            PermissionOnboardingScreen(
+                                onAllPermissionsGranted = {
+                                    lifecycleScope.launch {
+                                        repository.setBatteryPermissionAsked(true)
+                                    }
+                                    refreshPermissions()
+                                }
                             )
                         }
                     }
@@ -169,11 +179,7 @@ class MainActivity : ComponentActivity() {
                     viewModel.updateServiceStatus(serviceActive)
                     viewModel.setStrictMode(repository.isStrictMode())
                     
-                    val u = hasUsageStatsPermission()
-                    val o = Settings.canDrawOverlays(this@MainActivity)
-                    val b = isIgnoringBatteryOptimizations()
-                    val ba = repository.wasBatteryPermissionAsked()
-                    viewModel.updatePermissionStatus(u, o, b, ba)
+                    refreshPermissions()
                     
                     withContext(Dispatchers.IO) {
                         val monitoredApps = repository.getMonitoredApps()
@@ -195,6 +201,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        if (::viewModel.isInitialized && ::repository.isInitialized) {
+            refreshPermissions()
+        }
+    }
+
+    private fun refreshPermissions() {
+        val u = PermissionManager.hasUsageAccess(this)
+        val o = PermissionManager.hasOverlayPermission(this)
+        val b = PermissionManager.isIgnoringBatteryOptimizations(this)
+        val ba = repository.wasBatteryPermissionAsked()
+        viewModel.updatePermissionStatus(u, o, b, ba)
+    }
+
     private fun isServiceRunning(serviceClass: Class<*>): Boolean {
         val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
         try {
@@ -208,37 +229,8 @@ class MainActivity : ComponentActivity() {
         return false
     }
 
-    private fun isIgnoringBatteryOptimizations(): Boolean {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        return pm.isIgnoringBatteryOptimizations(packageName)
-    }
-
-    private fun requestUsagePermission() {
-        startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-        Toast.makeText(this, "Enable Usage Access", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun requestOverlayPermission() {
-        val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
-        startActivity(intent)
-        Toast.makeText(this, "Enable Overlay Permission", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun requestBatteryPermission(repository: DataRepository) {
-        lifecycleScope.launch { repository.setBatteryPermissionAsked(true) }
-        val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-            data = Uri.parse("package:$packageName")
-        }
-        try {
-            startActivity(intent)
-        } catch (e: Exception) {
-            startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-        }
-        Toast.makeText(this, "Set Battery to 'Unrestricted'", Toast.LENGTH_SHORT).show()
-    }
-
     private fun startMonitoring() {
-        if (!hasUsageStatsPermission() || !Settings.canDrawOverlays(this)) {
+        if (!PermissionManager.hasUsageAccess(this) || !PermissionManager.hasOverlayPermission(this)) {
             Toast.makeText(this, "Please grant critical permissions first", Toast.LENGTH_SHORT).show()
             return
         }
@@ -269,17 +261,6 @@ class MainActivity : ComponentActivity() {
             putExtra("mode", "stats")
         }
         startActivity(intent)
-    }
-
-    private fun hasUsageStatsPermission(): Boolean {
-        val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-        val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            appOps.unsafeCheckOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), packageName)
-        } else {
-            @Suppress("DEPRECATION")
-            appOps.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, android.os.Process.myUid(), packageName)
-        }
-        return mode == AppOpsManager.MODE_ALLOWED
     }
 }
 
@@ -570,69 +551,4 @@ fun GoalSetterDialog(currentGoal: Int, onDismiss: () -> Unit, onConfirm: (Int) -
         confirmButton = { TextButton(onClick = { onConfirm(goal.toInt()) }) { Text("Save") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } }
     )
-}
-
-@Composable
-fun PermissionOverlay(
-    usageOk: Boolean,
-    overlayOk: Boolean,
-    batteryOk: Boolean,
-    batteryAsked: Boolean,
-    onGrantUsage: () -> Unit,
-    onGrantOverlay: () -> Unit,
-    onGrantBattery: () -> Unit
-) {
-    Surface(modifier = Modifier.fillMaxSize(), color = Color.Black.copy(alpha = 0.9f)) {
-        Column(
-            modifier = Modifier.padding(32.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(Icons.Rounded.Security, contentDescription = null, modifier = Modifier.size(64.dp), tint = Color.White)
-            Spacer(modifier = Modifier.height(24.dp))
-            Text("Setup Required", style = MaterialTheme.typography.headlineMedium, color = Color.White, fontWeight = FontWeight.Bold)
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                "To protect your focus, we need these permissions. Green means granted!",
-                color = Color.White.copy(alpha = 0.7f),
-                textAlign = TextAlign.Center,
-                style = MaterialTheme.typography.bodyMedium
-            )
-            Spacer(modifier = Modifier.height(32.dp))
-            
-            PermissionItem("1. Usage Access", usageOk, onGrantUsage)
-            Spacer(modifier = Modifier.height(16.dp))
-            PermissionItem("2. Overlay (Popup)", overlayOk, onGrantOverlay)
-            Spacer(modifier = Modifier.height(16.dp))
-            PermissionItem("3. Unrestricted Battery", batteryOk || batteryAsked, onGrantBattery)
-            
-            Spacer(modifier = Modifier.height(40.dp))
-            Text(
-                "Note: Battery optimization can be changed in settings later.",
-                color = Color.White.copy(alpha = 0.5f),
-                fontSize = 12.sp,
-                textAlign = TextAlign.Center
-            )
-        }
-    }
-}
-
-@Composable
-fun PermissionItem(title: String, isGranted: Boolean, onClick: () -> Unit) {
-    Button(
-        onClick = if (isGranted) ({}) else onClick,
-        modifier = Modifier.fillMaxWidth().height(56.dp),
-        shape = RoundedCornerShape(16.dp),
-        colors = ButtonDefaults.buttonColors(
-            containerColor = if (isGranted) Color(0xFF4CAF50) else MaterialTheme.colorScheme.primary,
-            disabledContainerColor = Color(0xFF4CAF50)
-        ),
-        enabled = !isGranted
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(if (isGranted) Icons.Rounded.CheckCircle else Icons.AutoMirrored.Rounded.ArrowForward, contentDescription = null)
-            Spacer(modifier = Modifier.width(12.dp))
-            Text(title, fontWeight = FontWeight.Bold)
-        }
-    }
 }
